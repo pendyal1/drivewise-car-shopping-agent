@@ -108,7 +108,9 @@ def test_health_root_and_headers():
     root=client.get('/')
     assert root.status_code==200 and 'text/html' in root.headers['content-type']
     assert 'DriveWise' in root.text and 'New conversation' in root.text
-    assert 'sessionStorage' in root.text and 'innerHTML' not in root.text
+    assert 'sessionStorage' in root.text and 'renderMarkdown' in root.text
+    assert 'innerHTML' not in root.text
+    assert "safeSourceHosts = new Set(['www.fueleconomy.gov','www.nhtsa.gov','api.nhtsa.gov'])" in root.text
     assert root.headers['x-content-type-options']=='nosniff'
 
 
