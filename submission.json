@@ -1,4 +1,4 @@
 {
-  "deploy_url": "REPLACE_WITH_REAL_CLOUD_RUN_URL_BEFORE_SUBMISSION",
+  "deploy_url": "https://drivewise-car-shopping-agent-git-7l4zrnepoq-ue.a.run.app/",
   "authors": ["ap4839@columbia.edu"]
 }
