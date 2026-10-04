@@ -5,6 +5,8 @@ requests are accepted. All tool results are JSON strings for the class harness.
 """
 import json
 import math
+import re
+import statistics
 import time
 import xml.etree.ElementTree as ET
 from contextvars import ContextVar
@@ -185,51 +187,207 @@ def _normalize_vehicle(raw, description=None):
     return record
 
 
-def get_vehicle_efficiency(year, make, model, configuration=None, vehicle_id=None):
-    description = configuration
-    if vehicle_id is None:
-        years = _menu('year')
-        if isinstance(years, dict):
-            return years
-        if not _match(years, year):
-            return error('no_matching_data', 'That model year is not in the EPA menu.')
-        makes = _menu('make', {'year': year})
-        if isinstance(makes, dict):
-            return makes
-        match = _match(makes, make)
-        if not match:
-            return error('no_matching_data', 'That make is not in the EPA menu for the year.')
-        make = match['value']
-        models = _menu('model', {'year': year, 'make': make})
-        if isinstance(models, dict):
-            return models
-        match = _match(models, model)
-        if not match:
-            return {**error('no_matching_data', 'Use an exact EPA model name, including Hybrid when applicable.'), 'model_options': models[:12], 'sources': [FE_SOURCE]}
-        model = match['value']
-        options = _menu('options', {'year': year, 'make': make, 'model': model})
+def _terms(value):
+    """Normalize common EPA configuration language into stable matching tokens."""
+    text_value = re.sub(r'[^a-z0-9]+', ' ', str(value or '').casefold()).strip()
+    replacements = {
+        r'\ball wheel drive\b|\ballwheel drive\b|\bawd\b': ' awd ',
+        r'\bfour wheel drive\b|\b4 wheel drive\b|\b4wd\b': ' 4wd ',
+        r'\bfront wheel drive\b|\bfwd\b': ' fwd ',
+        r'\brear wheel drive\b|\brwd\b': ' rwd ',
+        r'\bcontinuously variable transmission\b|\bcvt\b|\be cvt\b': ' cvt automatic ',
+        r'\bautomatic transmission\b|\bauto\b': ' automatic ',
+        r'\bmanual transmission\b': ' manual ',
+        r'\bplug in hybrid\b|\bphev\b': ' plug_in_hybrid hybrid ',
+        r'\belectric vehicle\b|\bev\b': ' electric ',
+    }
+    for pattern, replacement in replacements.items():
+        text_value = re.sub(pattern, replacement, text_value)
+    return tuple(dict.fromkeys(text_value.split()))
+
+
+def _hint_match(hint, value):
+    wanted, available = set(_terms(hint)), set(_terms(value))
+    if not wanted or not available:
+        return 0
+    if wanted <= available:
+        return 1
+    return len(wanted & available) / len(wanted)
+
+
+def _model_compatible(requested, actual):
+    requested_terms, actual_terms = _terms(requested), _terms(actual)
+    return bool(requested_terms) and actual_terms[:len(requested_terms)] == requested_terms
+
+
+def _powertrain_label(raw):
+    return _normalize_vehicle(raw).get('fuel_type')
+
+
+def _range(records):
+    fields = ('combined_mpg', 'combined_mpge', 'annual_fuel_cost_usd', 'ev_range_miles')
+    normalized = [_normalize_vehicle(raw) for _, raw in records]
+    result = {}
+    for field in fields:
+        values = [row[field] for row in normalized if row.get(field) is not None]
+        if values:
+            result[field] = {'minimum': min(values), 'maximum': max(values)}
+    return result
+
+
+def _configuration_records(year, make, model):
+    years = _menu('year')
+    if isinstance(years, dict):
+        return years
+    if not _match(years, year):
+        return error('no_matching_data', 'That model year is not in the EPA menu.')
+    makes = _menu('make', {'year': year})
+    if isinstance(makes, dict):
+        return makes
+    make_match = _match(makes, make)
+    if not make_match:
+        return error('no_matching_data', 'That make is not in the EPA menu for the year.')
+    canonical_make = make_match['value']
+    models = _menu('model', {'year': year, 'make': canonical_make})
+    if isinstance(models, dict):
+        return models
+    model_matches = [row for row in models if _model_compatible(model, row['value'])]
+    if not model_matches:
+        return {**error('no_matching_data', 'Use an exact EPA model name, including Hybrid when applicable.'),
+                'model_options': models[:12], 'sources': [FE_SOURCE]}
+    records = []
+    for model_match in model_matches:
+        canonical_model = model_match['value']
+        options = _menu('options', {'year': year, 'make': canonical_make, 'model': canonical_model})
         if isinstance(options, dict):
             return options
-        if configuration:
-            options = [x for x in options if configuration.casefold() in str(x['text']).casefold()]
-        if not options:
-            return error('no_matching_data', 'No EPA configuration matched.', 'Provide an EPA vehicle ID or exact configuration.')
-        if len(options) != 1:
-            return {'ambiguous': True, 'option_count': len(options), 'options': options[:8], 'truncated': len(options) > 8,
-                    'suggestion': 'Choose a configuration or EPA vehicle ID; no configuration was silently selected.', 'sources': [FE_SOURCE]}
-        vehicle_id, description = options[0]['value'], options[0]['text']
-        if not str(vehicle_id).isdigit():
-            return error('malformed_response', 'EPA configuration ID was invalid.')
-    data = safe_get(FE + '/vehicle/' + str(vehicle_id))
-    if 'error' in data:
-        return data
-    raw = data.get('vehicle', data)
-    if not isinstance(raw, dict):
-        return error('malformed_response', 'EPA vehicle record was malformed.')
-    # Identity fields must be present; no guessing from the request.
-    if _number(raw.get('year')) != year or str(raw.get('make', '')).casefold() != make.casefold() or str(raw.get('model', '')).casefold() != model.casefold():
-        return error('no_matching_data', 'The EPA record did not match the requested vehicle identity.', 'Check the EPA model name and vehicle ID.')
-    return _normalize_vehicle(raw, description)
+        for option in options:
+            if not str(option.get('value', '')).isdigit():
+                return error('malformed_response', 'EPA configuration data contained an invalid vehicle ID.')
+            data = safe_get(FE + '/vehicle/' + str(option['value']))
+            if 'error' in data:
+                continue
+            raw = data.get('vehicle', data)
+            if not isinstance(raw, dict):
+                continue
+            if (_number(raw.get('year')) == year and str(raw.get('make', '')).casefold() == str(canonical_make).casefold()
+                    and str(raw.get('model', '')).casefold() == str(canonical_model).casefold()):
+                described = dict(option)
+                described['text'] = f'{canonical_model} · {option.get("text")}'
+                records.append((described, raw))
+    if not records:
+        return error('malformed_response', 'EPA configuration records were missing or malformed.')
+    return {'make': canonical_make, 'model': model, 'records': records}
+
+
+def _representative(records):
+    normalized = [(option, raw, _normalize_vehicle(raw, option.get('text'))) for option, raw in records]
+    efficiency_values = [row.get('combined_mpge') or row.get('combined_mpg') for _, _, row in normalized]
+    cost_values = [row.get('annual_fuel_cost_usd') for _, _, row in normalized]
+    eff_median = statistics.median(v for v in efficiency_values if v is not None) if any(v is not None for v in efficiency_values) else 0
+    cost_median = statistics.median(v for v in cost_values if v is not None) if any(v is not None for v in cost_values) else 0
+    special = re.compile(r'\b(performance|competition|track|launch|limited edition|special edition|police|taxi)\b', re.I)
+    ordinary = [row for row in normalized if not special.search(str(row[0].get('text', '')))] or normalized
+    def key(item):
+        option, _, row = item
+        efficiency = row.get('combined_mpge') or row.get('combined_mpg')
+        cost = row.get('annual_fuel_cost_usd')
+        distance = (abs(efficiency - eff_median) / max(1, eff_median) if efficiency is not None else 1)
+        distance += (abs(cost - cost_median) / max(1, cost_median) if cost is not None else 1)
+        return (distance, int(option['value']))
+    return min(ordinary, key=key)
+
+
+def _resolve_configuration(year, make, model, configuration_id=None, vehicle_id=None, configuration=None,
+                           trim=None, fuel_type=None, drivetrain=None, transmission=None, engine=None, body_style=None):
+    requested_id = configuration_id if configuration_id is not None else vehicle_id
+    if requested_id is not None:
+        data = safe_get(FE + '/vehicle/' + str(requested_id))
+        if 'error' in data:
+            return data
+        raw = data.get('vehicle', data)
+        if not isinstance(raw, dict):
+            return error('malformed_response', 'EPA vehicle record was malformed.')
+        if (_number(raw.get('year')) != year or str(raw.get('make', '')).casefold() != make.casefold()
+                or not _model_compatible(model, raw.get('model', ''))):
+            return error('no_matching_data', 'The EPA record did not match the requested vehicle identity.', 'Check the EPA model name and configuration ID.')
+        return raw, {'mode': 'exact', 'selected_id': str(requested_id),
+                     'selected_description': _text(raw.get('eng_dscr')) or _text(raw.get('trany')),
+                     'confidence': 'high', 'matched_hints': ['configuration_id'], 'alternatives': [],
+                     'possible_result_range': {}, 'requires_clarification': False}
+
+    menu = _configuration_records(year, make, model)
+    if 'error' in menu:
+        return menu
+    records = menu['records']
+    hints = {'trim': trim or configuration, 'fuel_type': fuel_type, 'drivetrain': drivetrain,
+             'transmission': transmission, 'engine': engine, 'body_style': body_style}
+    weights = {'trim': 40, 'fuel_type': 25, 'drivetrain': 15, 'engine': 10, 'transmission': 7, 'body_style': 3}
+    active = {key: value for key, value in hints.items() if value}
+    scored = []
+    for option, raw in records:
+        candidate_values = {
+            'trim': ' '.join(filter(None, (_text(option.get('text')), _text(raw.get('eng_dscr'))))),
+            'fuel_type': ' '.join(filter(None, (_powertrain_label(raw), _text(raw.get('fuelType')), _text(raw.get('atvType'))))),
+            'drivetrain': raw.get('drive'), 'transmission': raw.get('trany'),
+            'engine': ' '.join(filter(None, (_text(raw.get('eng_dscr')), _text(raw.get('displ')), _text(raw.get('cylinders'))))),
+            'body_style': raw.get('VClass'),
+        }
+        matches = {key: _hint_match(value, candidate_values.get(key)) for key, value in active.items()}
+        denominator = sum(weights[key] for key in active) or 1
+        score = sum(weights[key] * matches[key] for key in active) / denominator
+        scored.append((score, option, raw, [key for key, value in matches.items() if value >= .75]))
+    scored.sort(key=lambda item: (-item[0], int(item[1]['value'])))
+    powertrains = {label for _, raw in records if (label := _powertrain_label(raw))}
+    possible_range = _range(records)
+    if active:
+        best = scored[0]
+        margin = best[0] - (scored[1][0] if len(scored) > 1 else 0)
+        adequate = best[0] >= .6 and (margin >= .08 or best[0] >= .95)
+        if adequate:
+            selected = (best[1], best[2], _normalize_vehicle(best[2], best[1].get('text')))
+            mode, confidence = 'matched', 'high' if best[0] >= .9 and margin >= .15 else 'medium'
+        else:
+            selected = _representative(records)
+            mode, confidence = 'ambiguous', 'low'
+    else:
+        selected = _representative(records)
+        mode, confidence = ('ambiguous', 'low') if len(powertrains) > 1 else ('representative', 'low')
+        best = next(item for item in scored if item[1]['value'] == selected[0]['value'])
+    option, raw, _ = selected
+    alternatives = [{'id': str(item[1]['value']), 'description': item[1].get('text'),
+                     'fuel_type': _powertrain_label(item[2]), 'match_score': round(item[0], 3)}
+                    for item in scored if item[1]['value'] != option['value']][:4]
+    return raw, {'mode': mode, 'selected_id': str(option['value']), 'selected_description': option.get('text'),
+                 'confidence': confidence, 'matched_hints': best[3], 'alternatives': alternatives,
+                 'possible_result_range': possible_range,
+                 'requires_clarification': len(powertrains) > 1,
+                 'note': ('Multiple powertrain types are present; selection is provisional and the powertrain difference may change the result.'
+                          if len(powertrains) > 1 else 'The exact trim can change efficiency and cost estimates.')}
+
+
+def _get_vehicle_efficiency_uncached(year, make, model, **hints):
+    resolved = _resolve_configuration(year, make, model, **hints)
+    if isinstance(resolved, dict):
+        return resolved
+    raw, resolution = resolved
+    result = _normalize_vehicle(raw, resolution['selected_description'])
+    result['configuration_resolution'] = resolution
+    return result
+
+
+def _get_vehicle_efficiency(year, make, model, **hints):
+    context = _request_context.get()
+    key = ('efficiency', int(year), str(make).casefold().strip(), str(model).casefold().strip(),
+           tuple(sorted((name, str(value).casefold().strip()) for name, value in hints.items())))
+    research = context.setdefault('research_cache', {}) if context is not None else {}
+    if key not in research:
+        research[key] = _get_vehicle_efficiency_uncached(year, make, model, **hints)
+    return research[key]
+
+
+def get_vehicle_efficiency(year, make, model, **hints):
+    return _get_vehicle_efficiency(year, make, model, **hints)
 
 
 COST_DEFAULTS = {'annual_miles': 10000, 'fuel_type': 'gasoline', 'fuel_price_per_gallon': 3.50,
@@ -276,7 +434,10 @@ def calculate_ownership_cost(vehicle_price, down_payment, apr_percent, loan_mont
             'note': 'Estimates, not lender, insurance, repair, or purchase guarantees.'}
 
 
-def check_vehicle_recalls(year, make, model):
+_calculate_ownership_cost = calculate_ownership_cost
+
+
+def _check_vehicle_recalls_uncached(year, make, model):
     data = safe_get(NHTSA + '/recalls/recallsByVehicle', {'make': make, 'model': model, 'modelYear': year})
     if 'error' in data:
         return data
@@ -299,7 +460,20 @@ def check_vehicle_recalls(year, make, model):
             'scope_note': 'Base-model fallback; confirm applicability to the hybrid configuration.' if lookup_model != model else 'Requested model name.', 'note': RECALL_NOTE, 'sources': [SAFETY_SOURCE]}
 
 
-def get_vehicle_safety_profile(year, make, model):
+def _check_vehicle_recalls(year, make, model):
+    context = _request_context.get()
+    key = ('recalls', int(year), str(make).casefold().strip(), str(model).casefold().strip())
+    research = context.setdefault('research_cache', {}) if context is not None else {}
+    if key not in research:
+        research[key] = _check_vehicle_recalls_uncached(year, make, model)
+    return research[key]
+
+
+def check_vehicle_recalls(year, make, model):
+    return _check_vehicle_recalls(year, make, model)
+
+
+def _get_vehicle_safety_profile_uncached(year, make, model):
     path = f'/SafetyRatings/modelyear/{year}/make/{quote(make, safe="")}/model/{quote(model, safe="")}'
     data = safe_get(NHTSA + path, {'format': 'json'})
     variants, missing = [], []
@@ -332,7 +506,7 @@ def get_vehicle_safety_profile(year, make, model):
         common[key] = values[0] if values and None not in values and len(set(values)) == 1 and len(rows or []) <= 4 else None
         if common[key] is None:
             missing.append({'field': key, 'error': 'missing_or_ambiguous'})
-    recalls = check_vehicle_recalls(year=year, make=make, model=lookup_model)
+    recalls = _check_vehicle_recalls(year=year, make=make, model=lookup_model)
     complaints = safe_get(NHTSA + '/complaints/complaintsByVehicle', {'make': make, 'model': lookup_model, 'modelYear': year})
     complaint_rows = _rows(complaints) if 'error' not in complaints else None
     if 'error' in recalls:
@@ -353,6 +527,19 @@ def get_vehicle_safety_profile(year, make, model):
             'note': 'Common ratings are reported only when all variants agree. No recall-count safety penalty is applied.'}
 
 
+def _get_vehicle_safety_profile(year, make, model):
+    context = _request_context.get()
+    key = ('safety', int(year), str(make).casefold().strip(), str(model).casefold().strip())
+    research = context.setdefault('research_cache', {}) if context is not None else {}
+    if key not in research:
+        research[key] = _get_vehicle_safety_profile_uncached(year, make, model)
+    return research[key]
+
+
+def get_vehicle_safety_profile(year, make, model):
+    return _get_vehicle_safety_profile(year, make, model)
+
+
 BASE_WEIGHTS = {'affordability': 30, 'energy': 20, 'space': 15, 'weather': 10, 'safety': 15, 'environment': 10}
 
 
@@ -361,112 +548,163 @@ def _clip(value):
 
 
 def rank_vehicles_for_lifestyle(candidates, lifestyle=None):
-    lifestyle = lifestyle or {}
+    lifestyle = dict(lifestyle or {})
+    for field in ('weather_conditions', 'road_conditions', 'preferred_fuel_types', 'hard_constraints'):
+        if field in lifestyle:
+            lifestyle[field] = list(dict.fromkeys(lifestyle[field]))
     weights = dict(BASE_WEIGHTS)
     for field, component in [('fuel_efficiency_priority', 'energy'), ('safety_priority', 'safety'), ('environmental_priority', 'environment')]:
         if field in lifestyle:
             weights[component] *= {'low': .5, 'medium': 1, 'high': 1.5}[lifestyle[field]]
     total_weight = sum(weights.values())
-    weights = {k: v * 100 / total_weight for k, v in weights.items()}
+    weights = {key: value * 100 / total_weight for key, value in weights.items()}
     ranked = []
+    weather_conditions = lifestyle.get('weather_conditions', [])
+    road_conditions = lifestyle.get('road_conditions', [])
+    hard_fields = set(lifestyle.get('hard_constraints', []))
+
     for order, candidate in enumerate(candidates):
-        identity = {k: candidate[k] for k in ('year', 'make', 'model')}
-        efficiency = get_vehicle_efficiency(**identity, **{k: candidate[k] for k in ('configuration', 'vehicle_id') if k in candidate})
-        safety = get_vehicle_safety_profile(**identity)
-        scores = {k: .5 for k in weights}
-        known, reasons, tradeoffs, failures, missing = set(), [], [], [], []
-        if 'error' in efficiency or efficiency.get('ambiguous'):
+        identity = {key: candidate[key] for key in ('year', 'make', 'model')}
+        hint_fields = ('configuration', 'configuration_id', 'vehicle_id', 'trim', 'fuel_type', 'drivetrain',
+                       'transmission', 'engine', 'body_style')
+        efficiency = _get_vehicle_efficiency(**identity, **{key: candidate[key] for key in hint_fields if key in candidate})
+        safety = _get_vehicle_safety_profile(**identity)
+        recalls = _check_vehicle_recalls(**identity)
+        scores = {key: .5 for key in weights}
+        known, reasons, tradeoffs, failures, missing, sensitivity = set(), [], [], [], [], []
+        v = {} if 'error' in efficiency else efficiency
+        if not v:
             missing.append({'field': 'efficiency', 'detail': efficiency})
-            efficiency_data = {}
-        else:
-            efficiency_data = efficiency
-        v = efficiency_data
+        resolution = v.get('configuration_resolution') or {'mode': 'ambiguous', 'confidence': 'low', 'alternatives': []}
+        if resolution.get('requires_clarification'):
+            sensitivity.append('Available EPA configurations span different powertrain types; confirming the powertrain could change energy, cost, and ranking results.')
         fuel_type = v.get('fuel_type')
         mpg = v.get('combined_mpg')
         if v.get('city_mpg') and v.get('highway_mpg') and 'city_driving_share' in lifestyle:
             share = lifestyle['city_driving_share']
             mpg = 1 / (share / v['city_mpg'] + (1 - share) / v['highway_mpg'])
-        cost = None
-        price = candidate.get('listing_price')
+
+        price, cost, affordability_parts = candidate.get('listing_price'), None, []
         if price is not None:
-            ratios = []
             if lifestyle.get('maximum_purchase_price'):
                 cap = lifestyle['maximum_purchase_price']
-                ratios.append(_clip(1 - price / cap / 2))
+                affordability_parts.append(_clip(1 - price / cap / 2))
                 if price > cap:
-                    failures.append('Listing price exceeds firm purchase budget.')
+                    failures.append('Listing price exceeds the explicitly declared firm purchase budget.')
             finance_fields = ('down_payment', 'apr_percent', 'loan_months')
-            if all(k in lifestyle for k in finance_fields) and fuel_type:
-                args = {'vehicle_price': price, **{k: lifestyle[k] for k in finance_fields}, 'fuel_type': fuel_type, 'energy_data_source': 'government_epa',
-                        **{k: lifestyle[k] for k in COST_DEFAULTS if k in lifestyle and k != 'fuel_type'}}
+            if all(field in lifestyle for field in finance_fields) and fuel_type:
+                args = {'vehicle_price': price, **{field: lifestyle[field] for field in finance_fields},
+                        'fuel_type': fuel_type, 'energy_data_source': 'government_epa',
+                        **{field: lifestyle[field] for field in COST_DEFAULTS if field in lifestyle and field != 'fuel_type'}}
                 if mpg:
                     args['mpg'] = mpg
                 if fuel_type in ('electric', 'plug_in_hybrid') and v.get('kwh_per_100_miles'):
                     args['kwh_per_100_miles'] = v['kwh_per_100_miles']
-                if fuel_type == 'plug_in_hybrid':
-                    if 'electric_mile_share' in lifestyle:
-                        args['electric_mile_share'] = lifestyle['electric_mile_share']
-                    if v.get('phev_blended'):
-                        missing.append({'field': 'ownership_cost', 'detail': 'Blended PHEV operation is outside split-mile cost model.'})
-                    else:
-                        cost = calculate_ownership_cost(**args)
+                if fuel_type == 'plug_in_hybrid' and 'electric_mile_share' in lifestyle:
+                    args['electric_mile_share'] = lifestyle['electric_mile_share']
+                if fuel_type == 'plug_in_hybrid' and (v.get('phev_blended') or 'electric_mile_share' not in args):
+                    missing.append({'field': 'ownership_cost', 'detail': 'PHEV cost needs a non-blended EPA record and an electric-mile share.'})
                 else:
-                    cost = calculate_ownership_cost(**args)
-                if cost and 'error' not in cost:
-                    government_keys = [k for k in ('mpg', 'kwh_per_100_miles') if k in args]
-                    cost['government_source_data'] = {k: args[k] for k in government_keys}
-                    cost['government_sources'] = v.get('sources', [])
-                    for k in government_keys:
-                        cost['user_provided_inputs'].pop(k, None)
-                    if lifestyle.get('maximum_monthly_ownership_cost'):
-                        cap = lifestyle['maximum_monthly_ownership_cost']
-                        ratios.append(_clip(1 - cost['estimated_total_monthly'] / cap / 2))
-                        if cost['estimated_total_monthly'] > cap:
-                            tradeoffs.append('Estimated monthly cost exceeds desired monthly target.')
-                elif cost:
-                    missing.append({'field': 'ownership_cost', 'detail': cost})
-                    cost = None
-            if ratios:
-                scores['affordability'] = sum(ratios) / len(ratios)
-                known.add('affordability')
+                    estimate = _calculate_ownership_cost(**args)
+                    if 'error' not in estimate:
+                        cost = estimate
+                        government_keys = [key for key in ('mpg', 'kwh_per_100_miles') if key in args]
+                        cost['government_source_data'] = {key: args[key] for key in government_keys}
+                        cost['government_sources'] = v.get('sources', [])
+                        for key in government_keys:
+                            cost['user_provided_inputs'].pop(key, None)
+                        if lifestyle.get('maximum_monthly_ownership_cost'):
+                            cap = lifestyle['maximum_monthly_ownership_cost']
+                            affordability_parts.append(_clip(1 - cost['estimated_total_monthly'] / cap / 2))
+                            if cost['estimated_total_monthly'] > cap:
+                                message = 'Estimated monthly cost exceeds the supplied monthly target.'
+                                if 'maximum_monthly_ownership_cost' in hard_fields:
+                                    failures.append(message)
+                                else:
+                                    tradeoffs.append(message)
+                    else:
+                        missing.append({'field': 'ownership_cost', 'detail': estimate})
+        if affordability_parts:
+            scores['affordability'] = sum(affordability_parts) / len(affordability_parts)
+            known.add('affordability')
         if cost is None:
-            missing.append({'field': 'ownership_cost', 'detail': 'Need listing price, financing terms, and unambiguous energy data.'})
+            missing.append({'field': 'ownership_cost', 'detail': 'Need listing price, financing terms, and adequate EPA energy data.'})
+
         energy_measure = v.get('combined_mpge') if fuel_type == 'electric' else mpg
         if energy_measure:
             scores['energy'] = _clip((energy_measure - 15) / (125 if fuel_type == 'electric' else 45))
             known.add('energy')
         preferences = lifestyle.get('preferred_fuel_types')
         if fuel_type and preferences:
-            scores['energy'] = (scores['energy'] + (1 if fuel_type in preferences else 0)) / 2
+            scores['energy'] = (scores['energy'] + (1 if fuel_type in preferences else .35)) / 2
             known.add('energy')
+            if fuel_type not in preferences:
+                tradeoffs.append('Powertrain is outside the preferred fuel types; treated as a preference rather than a disqualification.')
+        charging = lifestyle.get('charging_access')
+        if fuel_type in ('electric', 'plug_in_hybrid') and charging:
+            charging_fit = {'none': .15, 'public_only': .35, 'home_120v': .65, 'workplace': .7,
+                            'home_240v': 1, 'home_and_public': 1}[charging]
+            scores['energy'] = (scores['energy'] + charging_fit) / 2
+            known.add('energy')
+            if charging in ('none', 'public_only'):
+                tradeoffs.append('Limited charging access reduces EV/PHEV convenience; verify a practical charging routine.')
+                if 'charging_access' in hard_fields and fuel_type == 'electric':
+                    failures.append('Pure EV conflicts with the explicitly declared charging-access hard constraint.')
         if fuel_type in ('electric', 'plug_in_hybrid') and lifestyle.get('willing_to_charge_ev') is False:
-            scores['energy'] = 0 if fuel_type == 'electric' else min(scores['energy'], .25)
+            scores['energy'] = min(scores['energy'], .2 if fuel_type == 'electric' else .35)
             known.add('energy')
-            if fuel_type == 'electric':
-                failures.append('Electric vehicle conflicts with unwillingness to charge.')
-            tradeoffs.append('Charging access conflicts with the electric powertrain.')
-        space_parts = []
-        vehicle_class = str(v.get('vehicle_class') or '').lower()
+            tradeoffs.append('The stated unwillingness to charge materially reduces electric-powertrain fit, but it is not treated as a hard constraint unless charging_access is explicitly declared hard.')
+
+        space_parts, vehicle_class = [], str(v.get('vehicle_class') or '').lower()
         if 'regular_passenger_count' in lifestyle and v.get('passenger_volume_cu_ft'):
-            # Volume is a rough comfort proxy, never a seat-count claim.
-            space_parts.append(_clip(v['passenger_volume_cu_ft'] / (max(1, lifestyle['regular_passenger_count']) * 25)))
+            space_parts.append(_clip(v['passenger_volume_cu_ft'] / (lifestyle['regular_passenger_count'] * 25)))
             tradeoffs.append('Passenger volume is a comfort proxy; verify seat count and child-seat fit.')
         if lifestyle.get('cargo_need') and v.get('luggage_volume_cu_ft'):
             target = {'low': 10, 'medium': 18, 'high': 30}[lifestyle['cargo_need']]
             space_parts.append(_clip(v['luggage_volume_cu_ft'] / target))
         if lifestyle.get('parking_constraint') in ('moderate', 'tight') and vehicle_class:
-            compact = 'compact' in vehicle_class or 'two-seater' in vehicle_class
-            large = any(x in vehicle_class for x in ('large', 'standard', 'van'))
-            space_parts.append(1 if compact else .25 if large else .5)
-            tradeoffs.append('EPA class is a parking proxy; dimensions and turning radius are unavailable.')
+            compact = any(label in vehicle_class for label in ('compact', 'subcompact', 'two-seater'))
+            large = any(label in vehicle_class for label in ('large', 'standard', 'van', 'pickup'))
+            space_parts.append(1 if compact else .3 if large else .6)
+            tradeoffs.append('EPA class is a parking proxy; exterior dimensions and turning radius need verification.')
         if space_parts:
             scores['space'] = sum(space_parts) / len(space_parts)
             known.add('space')
-        if lifestyle.get('winter_weather_need') is True and v.get('drivetrain'):
-            drive = v['drivetrain'].lower()
-            scores['weather'] = 1 if 'all-wheel' in drive or '4-wheel' in drive else .6 if 'front' in drive else .4
+
+        climate = {'component_score': 50, 'evidence_used': [],
+                   'applicable_conditions': weather_conditions + road_conditions,
+                   'positive_fit_factors': [], 'cautions': [], 'unavailable_information': [], 'user_actions': []}
+        drive = str(v.get('drivetrain') or '').lower()
+        winter = any(condition in weather_conditions for condition in ('light_snow', 'heavy_snow', 'ice', 'mountain_weather'))
+        if winter and drive:
+            climate['evidence_used'].append('EPA drivetrain: ' + v['drivetrain'])
+            if 'all-wheel' in drive or '4-wheel' in drive:
+                scores['weather'] = .75
+                climate['positive_fit_factors'].append('Explicit AWD/4WD receives a modest snow/ice fit benefit.')
+            elif 'front' in drive:
+                scores['weather'] = .6
+                climate['positive_fit_factors'].append('FWD remains a viable winter layout and is not treated as a failure.')
+            elif 'rear' in drive:
+                scores['weather'] = .35
+                climate['cautions'].append('RWD receives a modest fit reduction for important snow/ice use.')
             known.add('weather')
-            tradeoffs.append('Drivetrain does not replace winter tires or guarantee snow safety.')
+            climate['user_actions'].append('Check tire condition and obtain condition-appropriate tires; drivetrain does not guarantee winter safety.')
+        if any(condition in road_conditions for condition in ('potholes', 'gravel', 'unpaved', 'off_road')):
+            climate['unavailable_information'] += ['ground clearance', 'tire specification', 'suspension durability', 'off-road capability']
+            climate['cautions'].append('EPA vehicle class is only a limited rough-road proxy; no capability claim is made.')
+            climate['user_actions'].append('Verify ground clearance, tires, and underbody condition for the intended roads.')
+        if 'extreme_cold' in weather_conditions and fuel_type in ('electric', 'plug_in_hybrid'):
+            climate['cautions'].append('Extreme cold can reduce usable electric range and increase cabin-heating energy use; no exact loss is estimated.')
+        if 'extreme_heat' in weather_conditions and fuel_type in ('electric', 'plug_in_hybrid'):
+            climate['cautions'].append('Extreme heat can increase climate-control energy use and affect battery performance; no degradation is predicted.')
+        if 'coastal_salt' in weather_conditions:
+            climate['user_actions'].append('Inspect a used vehicle for corrosion and salt exposure; no vehicle-specific corrosion penalty is applied.')
+        if 'flood_prone' in weather_conditions:
+            climate['user_actions'].append('Check title/history and obtain a pre-purchase inspection for flood exposure; no flood capability is inferred.')
+        if any(condition in weather_conditions for condition in ('heavy_rain', 'high_winds')):
+            climate['user_actions'].append('Verify tires, wipers, lights, and condition-specific handling during an inspection or test drive.')
+        climate['component_score'] = round(scores['weather'] * 100, 1)
+
         if safety.get('overall_rating') and safety.get('rating_scope_matches_candidate', True):
             scores['safety'] = (safety['overall_rating'] - 1) / 4
             known.add('safety')
@@ -475,39 +713,70 @@ def rank_vehicles_for_lifestyle(candidates, lifestyle=None):
             known.add('environment')
         for component in scores:
             if component not in known:
-                missing.append({'field': component, 'detail': 'Missing data or unspecified preference; neutral midpoint applied.'})
-        ordered = sorted(known, key=lambda k: (-scores[k], list(weights).index(k)))
-        evidence = {
-            'affordability': f'Listing price ${price}; available purchase/monthly targets compared against supplied budgets.',
-            'energy': f'{fuel_type or "Unknown powertrain"}; consumption measure {energy_measure} ' + ('MPGe' if fuel_type == 'electric' else 'MPG') + '; charging and fuel preferences applied when supplied.',
-            'space': f'EPA class {v.get("vehicle_class")}; passenger volume {v.get("passenger_volume_cu_ft")} cu ft; luggage {v.get("luggage_volume_cu_ft")} cu ft. Rough proxies only.',
-            'weather': f'Government drivetrain: {v.get("drivetrain")}; winter tires and conditions still matter.',
-            'safety': f'Applicable common NHTSA overall rating: {safety.get("overall_rating")} of 5 stars.',
-            'environment': f'EPA GHG score: {v.get("emissions_score")} of 10; not full lifecycle emissions.',
-        }
-        reasons += [f'{k}: {scores[k] * 100:.0f}% component fit. {evidence[k]}' for k in ordered[:3]]
-        tradeoffs += [f'{k}: {scores[k] * 100:.0f}% component fit.' for k in ordered if scores[k] < .5]
+                missing.append({'field': component, 'detail': 'Missing evidence or unspecified preference; neutral midpoint applied.'})
         if safety.get('rating_scope_matches_candidate') is False:
-            tradeoffs.append('Base-model safety data may not apply to the exact hybrid; safety score remains neutral.')
+            tradeoffs.append('Base-model safety data may not apply to the exact configuration; safety remains neutral.')
         if candidate.get('mileage') is not None:
             tradeoffs.append('Odometer mileage is recorded but is not used to predict repairs or reliability.')
         if candidate.get('vin'):
-            tradeoffs.append('User-supplied VIN is retained as context only; no VIN service request is made.')
-        if 'error' in safety:
-            missing.append({'field': 'safety', 'detail': safety})
+            tradeoffs.append('User-supplied VIN is context only; no bulk or automatic VIN lookup occurs.')
         missing.extend(safety.get('missing_data', []))
-        component_points = {k: round(scores[k] * weights[k], 3) for k in weights}
-        ranked.append({'candidate': candidate, 'original_order': order, 'total_fit_score': round(sum(scores[k] * weights[k] for k in scores), 3),
-                       'component_scores': component_points, 'weights': weights, 'strongest_fit_reasons': reasons or ['Insufficient evidence; neutral scores.'],
-                       'tradeoffs': tradeoffs, 'hard_constraint_failures': failures, 'missing_or_ambiguous_data': missing,
-                       'data_completeness': round(len(known) / len(weights), 3), 'ownership_cost': cost,
-                       'efficiency': efficiency, 'safety': safety,
-                       'government_sources_used': list(dict.fromkeys(efficiency.get('sources', []) + safety.get('sources', [])))})
-    ranked.sort(key=lambda r: (-r['total_fit_score'], -r['data_completeness'], r['original_order']))
+        if 'error' in recalls:
+            missing.append({'field': 'recalls', 'detail': recalls})
+
+        evidence = {
+            'affordability': f'Listing price {price}; only supplied budgets and financing terms are evaluated.',
+            'energy': f'{fuel_type or "Unknown powertrain"}; {energy_measure} {"MPGe" if fuel_type == "electric" else "MPG"}.',
+            'space': f'EPA class {v.get("vehicle_class")}; passenger volume {v.get("passenger_volume_cu_ft")}; luggage volume {v.get("luggage_volume_cu_ft")}.',
+            'weather': '; '.join(climate['evidence_used']) or 'No score-changing weather evidence available.',
+            'safety': f'Applicable common NHTSA overall rating: {safety.get("overall_rating")} of 5.',
+            'environment': f'EPA GHG score: {v.get("emissions_score")} of 10; not lifecycle emissions.',
+        }
+        ordered = sorted(known, key=lambda key: (-scores[key], list(weights).index(key)))
+        reasons = [f'{key}: {scores[key] * 100:.0f}% fit. {evidence[key]}' for key in ordered[:3]]
+        if resolution.get('possible_result_range'):
+            sensitivity.append('Other EPA configurations may change the result within: ' + json.dumps(resolution['possible_result_range'], sort_keys=True))
+            annual_range = resolution['possible_result_range'].get('annual_fuel_cost_usd')
+            monthly_cap = lifestyle.get('maximum_monthly_ownership_cost')
+            if cost and annual_range and monthly_cap:
+                selected_energy = cost['estimated_fuel_monthly'] + cost['estimated_electricity_monthly']
+                fixed_cost = cost['estimated_total_monthly'] - selected_energy
+                possible_monthly = (fixed_cost + annual_range['minimum'] / 12, fixed_cost + annual_range['maximum'] / 12)
+                if min(possible_monthly) <= monthly_cap <= max(possible_monthly):
+                    sensitivity.append('Configuration ambiguity can move the ownership estimate across the supplied monthly-cost target; clarify powertrain/trim before treating affordability as settled.')
+        component_points = {key: round(scores[key] * weights[key], 1) for key in weights}
+        total_score = round(sum(component_points.values()), 1)
+        hard_results = [{'constraint': 'maximum_purchase_price', 'passed': price <= lifestyle['maximum_purchase_price'],
+                         'detail': f'Listing price {price} versus firm cap {lifestyle["maximum_purchase_price"]}.'}
+                        for _ in [0] if price is not None and lifestyle.get('maximum_purchase_price')]
+        sources = list(dict.fromkeys(v.get('sources', []) + safety.get('sources', []) + recalls.get('sources', [])))
+        ranked.append({'candidate': candidate, 'original_order': order, 'overall_score': total_score,
+                       'total_fit_score': total_score, 'component_scores': component_points,
+                       'component_fit_percent': {key: round(value * 100, 1) for key, value in scores.items()},
+                       'weights': weights, 'selected_configuration': resolution.get('selected_description'),
+                       'automatic_selection_confidence': resolution.get('confidence'),
+                       'configuration_resolution': resolution, 'assumptions': ['Missing score inputs receive a neutral midpoint.'],
+                       'strongest_fit_reasons': reasons or ['Insufficient evidence; neutral scores applied.'],
+                       'important_tradeoffs': tradeoffs, 'tradeoffs': tradeoffs,
+                       'hard_constraint_results': hard_results, 'hard_constraint_failures': failures,
+                       'sensitivity_notes': sensitivity, 'missing_or_ambiguous_data': missing,
+                       'unknown_or_needs_verification': list(dict.fromkeys(climate['unavailable_information'])),
+                       'climate_weather_fit': climate, 'data_completeness': round(len(known) / len(weights), 3),
+                       'data_completeness_score': round(len(known) / len(weights) * 100),
+                       'ownership_cost': cost, 'efficiency': efficiency, 'safety': safety, 'recalls': recalls,
+                       'government_sources_used': sources})
+    ranked.sort(key=lambda row: (-row['total_fit_score'], -row['data_completeness'], row['original_order']))
+    close = None
+    if len(ranked) > 1 and ranked[0]['total_fit_score'] - ranked[1]['total_fit_score'] <= 2:
+        close = {'effectively_tied': True,
+                 'candidates': [ranked[0]['candidate'], ranked[1]['candidate']],
+                 'score_difference': round(ranked[0]['total_fit_score'] - ranked[1]['total_fit_score'], 1),
+                 'separator': 'The user preference with the most leverage is shown in each candidate sensitivity note; confirm configuration and hard constraints before choosing.'}
     return {'ranked_vehicles': ranked, 'weights': weights, 'lifestyle_inputs': lifestyle,
-            'method': '100-point deterministic fit. Missing evidence or unspecified preference receives half of component weight. Tie: score, completeness, original order. Hard constraints reported separately.',
+            'close_comparison': close,
+            'method': '100-point deterministic fit. Missing evidence receives a neutral midpoint. Hard constraints are reported separately and only explicitly hard fields can disqualify. Tie order: score, completeness, original order.',
             'ownership_duration_years': lifestyle.get('expected_ownership_years'),
-            'duration_note': 'Duration is context; no depreciation, resale, or future repair forecast is modeled.',
+            'duration_note': 'Duration is context; no depreciation, resale, reliability, or future repair forecast is modeled.',
             'note': 'Highest fit under supplied preferences is not objectively best, mechanically sound, reliable, fairly priced, or guaranteed affordable.'}
 
 
@@ -528,12 +797,22 @@ def obj(properties, required=()):
     return {'type': 'object', 'properties': properties, 'required': list(required), 'additionalProperties': False}
 
 
-IDENTITY = {'year': num('Four-digit U.S. model year, e.g. 2022.', 1981, 2030, True),
+IDENTITY = {'year': num('Four-digit model year, e.g. 2022. Future/nonexistent years remain valid syntax so the tool can preserve other candidates and return a no-match result.', 1981, 2100, True),
             'make': text('Manufacturer name as listed in government menus, e.g. Honda.'),
             'model': text('Exact government model name, e.g. Accord Hybrid for EPA; NHTSA may use Accord.')}
-EFFICIENCY = obj({**IDENTITY, 'configuration': text('Optional EPA configuration description substring; trim names may not match EPA configurations.', max_length=160),
-                 'vehicle_id': num('Optional FuelEconomy.gov vehicle record ID; must match supplied year/make/model.', 1, 999999, True)}, IDENTITY)
 FUEL_TYPES = ['gasoline', 'diesel', 'hybrid', 'plug_in_hybrid', 'electric']
+CONFIGURATION_HINTS = {
+    'configuration': text('Optional free-text EPA configuration hint; matching is deterministic and case-insensitive.', max_length=160),
+    'configuration_id': num('Optional exact FuelEconomy.gov vehicle/configuration ID; must match year, make, and model.', 1, 999999, True),
+    'vehicle_id': num('Legacy alias for configuration_id; supply only one ID.', 1, 999999, True),
+    'trim': text('Optional trim name such as EX-L or XLE; highest-weight matching hint.', max_length=80),
+    'fuel_type': choice('Optional requested powertrain hint; used to avoid gasoline/hybrid/EV ambiguity.', FUEL_TYPES),
+    'drivetrain': text('Optional drivetrain hint such as AWD, all-wheel drive, FWD, or 4WD.', max_length=60),
+    'transmission': text('Optional transmission hint such as automatic, CVT, or 6-speed manual.', max_length=80),
+    'engine': text('Optional engine hint such as 2.0L 4-cylinder.', max_length=80),
+    'body_style': text('Optional body or vehicle-class hint such as hatchback or compact SUV.', max_length=80),
+}
+EFFICIENCY = obj({**IDENTITY, **CONFIGURATION_HINTS}, IDENTITY)
 COST_PROPERTIES = {
     'energy_data_source': choice('Provenance of MPG/MPGe/kWh data: user estimate or an EPA record previously retrieved in this session; never label guessed values as government data.', ['user_estimate', 'government_epa']),
     'vehicle_price': num('Purchase price in USD before taxes or fees.', .01),
@@ -552,33 +831,45 @@ COST_PROPERTIES = {
     'monthly_maintenance_reserve': num('USD/month reserve, not a repair forecast; assumed 75 when omitted.', 0, 10000),
 }
 COST_SCHEMA = obj(COST_PROPERTIES, ('vehicle_price', 'down_payment', 'apr_percent', 'loan_months'))
-CANDIDATE = obj({**EFFICIENCY['properties'], 'vin': text('Optional 17-character VIN explicitly provided by the user; context only, never decoded or looked up.', r'^[A-HJ-NPR-Z0-9]{17}$', 17),
+CANDIDATE = obj({**IDENTITY, **CONFIGURATION_HINTS, 'vin': text('Optional 17-character VIN explicitly provided by the user; context only, never decoded or looked up.', r'^[A-HJ-NPR-Z0-9]{17}$', 17),
                  'listing_price': num('Optional asking price from a user-found listing in USD; not market value.', .01),
                  'mileage': num('Optional odometer miles, recorded without reliability scoring.', 0, 2_000_000, True)}, IDENTITY)
+WEATHER_CONDITIONS = ['mild', 'mixed_seasons', 'light_snow', 'heavy_snow', 'ice', 'heavy_rain', 'flood_prone',
+                      'extreme_heat', 'extreme_cold', 'high_winds', 'coastal_salt', 'mountain_weather']
+ROAD_CONDITIONS = ['mostly_city', 'mostly_highway', 'steep_grades', 'potholes', 'gravel', 'unpaved', 'off_road']
 LIFESTYLE = obj({
     **{k: v for k, v in COST_PROPERTIES.items() if k not in ('vehicle_price', 'fuel_type', 'mpg', 'mpge', 'kwh_per_100_miles', 'energy_data_source')},
     'maximum_purchase_price': num('Firm maximum purchase price in USD; violations reported separately.', .01),
     'maximum_monthly_ownership_cost': num('Desired monthly ownership USD target; a soft target, not guarantee.', .01, 100000),
     'city_driving_share': num('Fraction of driving in city, 0 to 1; remaining fraction is highway.', 0, 1),
+    'highway_driving_share': num('Optional fraction of driving on highways, 0 to 1; when city share is supplied it remains authoritative.', 0, 1),
+    'daily_commute_miles': num('Round-trip daily commute distance in miles.', 0, 1000),
     'regular_passenger_count': num('Regular occupants including driver; volume proxy cannot establish seat count.', 1, 12, True),
     'cargo_need': choice('Cargo need category; maps to 10/18/30 cubic foot proxies.', ['low', 'medium', 'high']),
     'parking_constraint': choice('Parking space constraint; EPA class is a rough size proxy.', ['none', 'moderate', 'tight']),
-    'winter_weather_need': {'type': 'boolean', 'description': 'True if winter traction matters; drivetrain proxy only.'},
+    'weather_conditions': {'type': 'array', 'description': 'One or more climate or weather conditions; duplicates are removed by the tool.',
+                           'items': choice('Supported weather condition.', WEATHER_CONDITIONS), 'minItems': 1, 'maxItems': 12},
+    'road_conditions': {'type': 'array', 'description': 'One or more recurring road/driving conditions; duplicates are removed by the tool.',
+                        'items': choice('Supported road condition.', ROAD_CONDITIONS), 'minItems': 1, 'maxItems': 7},
+    'charging_access': choice('Available EV/PHEV charging access.', ['none', 'home_120v', 'home_240v', 'workplace', 'public_only', 'home_and_public']),
     **{k: choice('Relative scoring priority; medium leaves base weight, low halves and high multiplies by 1.5.', ['low', 'medium', 'high']) for k in ('fuel_efficiency_priority', 'safety_priority', 'environmental_priority')},
     'preferred_fuel_types': {'type': 'array', 'description': 'Optional preferred powertrain categories.', 'items': choice('Powertrain category.', FUEL_TYPES), 'minItems': 1, 'maxItems': 5, 'uniqueItems': True},
-    'willing_to_charge_ev': {'type': 'boolean', 'description': 'Whether user is willing to charge; false is a hard conflict for pure EVs.'},
+    'willing_to_charge_ev': {'type': 'boolean', 'description': 'Whether the user is willing to charge; false strongly reduces EV/PHEV fit but is not automatically disqualifying.'},
     'expected_ownership_years': num('Expected ownership duration in years, context only; no depreciation forecast.', .5, 30),
+    'hard_constraints': {'type': 'array', 'description': 'Only fields explicitly listed here are treated as disqualifying, except maximum_purchase_price which is declared firm by its field definition.',
+                         'items': choice('Explicit hard constraint field.', ['maximum_purchase_price', 'maximum_monthly_ownership_cost', 'charging_access']),
+                         'minItems': 1, 'maxItems': 3},
 })
 SCHEMAS = {'get_vehicle_efficiency': EFFICIENCY, 'calculate_ownership_cost': COST_SCHEMA,
            'check_vehicle_recalls': obj(IDENTITY, IDENTITY), 'get_vehicle_safety_profile': obj(IDENTITY, IDENTITY),
            'rank_vehicles_for_lifestyle': obj({'candidates': {'type': 'array', 'description': 'Two to five vehicles supplied by user; no inventory search.', 'items': CANDIDATE, 'minItems': 2, 'maxItems': 5},
                                              'lifestyle': {**LIFESTYLE, 'description': 'Optional preferences; omitted preferences are neutral, never invented.'}}, ('candidates',))}
 DESCRIPTIONS = {
-    'get_vehicle_efficiency': 'Use for government efficiency/specifications for a known year/make/model; completes EPA menu flow internally. Do not use for live inventory or market value. Ambiguous configurations require clarification.',
+    'get_vehicle_efficiency': 'Use for government efficiency/specifications for one known vehicle; completes EPA menu flow and deterministic configuration resolution internally. Do not use for live inventory, market value, or every candidate before a ranking.',
     'calculate_ownership_cost': 'Use for financing and energy budgets with purchase price, financing terms, and adequate energy assumptions. Do not use to predict repairs or local market value. Estimates exclude taxes, fees and depreciation.',
     'check_vehicle_recalls': 'Use for model-level NHTSA recall campaigns for a known vehicle. Do not use to prove a VIN is affected or a repair is open/completed.',
     'get_vehicle_safety_profile': 'Use for NHTSA ratings, recall count, and bounded complaint context. Completes variant and ID requests internally. Do not use complaint or recall counts as reliability scores.',
-    'rank_vehicles_for_lifestyle': 'Use to compare two to five user-supplied candidates with deterministic lifestyle scoring. Internally fetches EPA and NHTSA data and calculates cost when possible. Do not use to search inventory or certify a winner; omit unknown preferences.',
+    'rank_vehicles_for_lifestyle': 'Use once to compare two to five user-supplied candidates. Internally resolves configurations, fetches EPA efficiency plus NHTSA safety/complaints/recalls for all candidates, calculates cost, and ranks weather/road/lifestyle fit. Do not call lower-level research tools around it, search inventory, or certify a winner; omit unknown preferences.',
 }
 TOOLS = [{'type': 'function', 'function': {'name': name, 'description': DESCRIPTIONS[name], 'parameters': schema}} for name, schema in SCHEMAS.items()]
 # Implementations return dictionaries; the public entrypoints below enforce schemas
@@ -591,7 +882,7 @@ def run_tool(name, args):
         return json.dumps(error('unknown_tool', 'The requested tool is not available.', 'Use one of the five declared DriveWise tools.'))
     token = None
     if _request_context.get() is None:
-        token = _request_context.set({'deadline': time.monotonic() + 45, 'cache': {}})
+        token = _request_context.set({'deadline': time.monotonic() + 45, 'cache': {}, 'research_cache': {}})
     try:
         try:
             valid = isinstance(args, dict) and len(json.dumps(args, allow_nan=False)) <= 24000 and Draft202012Validator(SCHEMAS[name]).is_valid(args)

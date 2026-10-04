@@ -10,18 +10,18 @@
 <body>
 <div class="wrap">
 <header><div class="brand"><span>↗</span>DriveWise</div><div class="eyebrow">Find your fit. Understand the tradeoffs.</div><button id="new" class="outline" type="button">New conversation</button></header>
-<section class="hero" aria-labelledby="title"><div><div class="eyebrow">Your shortlist. Government evidence.</div><h1>A clearer road to<br><em>your next car.</em></h1><p class="lead">Bring two to five cars you’ve already found. Compare energy costs, safety evidence, and the everyday details that make a car fit your life.</p><div class="tags"><span>EPA efficiency</span><span>NHTSA safety &amp; recalls</span><span>Explainable fit scores</span></div></div>
+<section class="hero" aria-labelledby="title"><div><div class="eyebrow">Your shortlist. Government evidence.</div><h1>A clearer road to<br><em>your next car.</em></h1><p class="lead">Bring two to five cars you’ve already found. Compare energy costs, safety evidence, weather and road fit, charging access, and the everyday details that make a car fit your life.</p><div class="tags"><span>Automatic configuration matching</span><span>Snow, heat &amp; charging fit</span><span>EPA + NHTSA evidence</span></div></div>
 <div class="demo" aria-label="Illustrative lifestyle ranking"><div class="eyebrow">A sample ranking · fictional demo values</div><h2>See the fit. See the uncertainty.</h2><p>Fictional candidates, not real listings or verified vehicle scores.<br>These example scores show the format of a lifestyle comparison.</p><div class="demo-row"><div><strong>01 / Candidate A</strong><small>Strong energy fit for a daily commuter.</small></div><span class="badge">78 / 100 fit</span></div><div class="demo-row"><div><strong>02 / Candidate B</strong><small>Missing safety evidence → neutral midpoint.</small></div><span class="badge">74 / 100 fit</span></div><div class="demo-row"><div><strong>03 / Candidate C</strong><small>Firm budget exceeded → flagged separately.</small></div><span class="badge">70 / 100 fit</span></div><p>A high fit score can still conflict with your constraints.</p></div></section>
-<div class="workspace"><aside><section><h2>How to start</h2><p>Give each car’s year, make, and model. Add trim or EPA ID, asking price, and mileage if known. Tell us about your driving, passengers, budget, parking, and charging access.</p><p>You can ask about one car, too. Follow-up questions remember this conversation.</p></section><section><h2>What evidence can’t tell you</h2><ul><li>No live listing search or current local market value.</li><li>No mechanical inspection or title history.</li><li>Model recalls do not prove VIN inclusion or repair completion.</li><li>Costs are estimates, not lender, insurance, repair, or purchase guarantees.</li></ul></section></aside>
+<div class="workspace"><aside><section><h2>How to start</h2><p>Give each car’s year, make, and model. Trim is optional: DriveWise can select and disclose a representative EPA configuration. Add asking price and mileage if known.</p><p>Describe city/highway driving, passengers, cargo, parking, charging, and conditions such as snow, ice, heavy rain, extreme heat or cold, potholes, and gravel.</p><p>You can ask about one car, too. Follow-up questions remember this conversation.</p></section><section><h2>What evidence can’t tell you</h2><ul><li>No live listing search or current local market value.</li><li>No mechanical inspection or title history.</li><li>Model recalls do not prove VIN inclusion or repair completion.</li><li>No invented ground clearance, tire performance, reliability, or flood/off-road capability.</li><li>Costs are estimates, not lender, insurance, repair, or purchase guarantees.</li></ul></section></aside>
 <main class="chat"><div class="chat-heading"><h2>Your decision notebook</h2><span class="live">Government data · visible tools</span></div><div id="messages" role="log" aria-label="Conversation" aria-live="polite"><div class="welcome"><p>Start with your shortlist. We’ll surface what’s known, what’s missing, and what changes the comparison.</p><div class="samples"><button type="button" class="sample" data-query="0">Compare three everyday sedans</button><button type="button" class="sample" data-query="1">Estimate a hybrid’s monthly cost</button><button type="button" class="sample" data-query="2">Understand safety and recalls</button></div></div></div>
-<form id="form" class="composer"><label for="message">Your vehicles and priorities</label><div class="input-row"><textarea id="message" maxlength="8000" required placeholder="e.g. Compare a 2022 Accord Hybrid and 2022 Camry Hybrid. I drive 15,000 miles/year and park on the street."></textarea><button id="send" type="submit">Compare →</button></div><p class="hint">Enter to send · Shift + Enter for a new line · Up to 8,000 characters</p><p id="status" role="status"></p></form></main></div>
+<form id="form" class="composer"><label for="message">Your vehicles and priorities</label><div class="input-row"><textarea id="message" maxlength="8000" required placeholder="e.g. Compare three cars for street parking, snow, heavy rain, potholes, and no home charging. Choose configurations automatically."></textarea><button id="send" type="submit">Compare →</button></div><p class="hint">Enter to send · Shift + Enter for a new line · Up to 8,000 characters</p><p id="status" role="status"></p></form></main></div>
 <footer><span>DriveWise · IEOR 4570 · Decision support for U.S. car shoppers</span><span>EPA and NHTSA data can be incomplete. Confirm configuration before relying on an estimate.</span></footer>
 </div>
 <script>
 'use strict';
 const queries = [
- 'Compare a 2022 Honda Accord Hybrid, a 2022 Toyota Camry Hybrid, and a 2021 Subaru Legacy. I drive 15,000 miles a year, have a 40-mile daily commute, park on the street, occasionally drive in snow, and want to keep total monthly cost below $750.',
- 'Estimate ownership cost for a 2022 Honda Accord Hybrid at $24,000, $5,000 down, 6.5% APR for 60 months, 15,000 miles/year, and $175/month insurance. Retrieve EPA efficiency first and ask me if the configuration is ambiguous.',
+ 'Compare a 2022 Honda Accord Hybrid, 2022 Toyota Camry Hybrid, and 2021 Subaru Legacy. I drive 15,000 miles a year, park on the street, face heavy rain and occasional snow and ice, and do not have home charging. Automatically choose the most appropriate configuration when I do not provide a trim.',
+ 'Estimate ownership cost for a 2022 Honda Accord Hybrid at $24,000, $5,000 down, 6.5% APR for 60 months, 15,000 miles/year, and $175/month insurance. Select and disclose a representative EPA configuration if needed.',
  'What NHTSA safety ratings and recall campaigns are available for a 2022 Honda Accord, and what do those results not tell me?'
 ];
 const messages = document.getElementById('messages'), input = document.getElementById('message'), sendButton = document.getElementById('send'), newButton = document.getElementById('new'), status = document.getElementById('status');
@@ -29,7 +29,12 @@ const storageKey = 'drivewise.session_id';
 const sessionPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 let sessionId = null, busy = false;
 try { const stored = sessionStorage.getItem(storageKey); if(stored && sessionPattern.test(stored)) sessionId = stored; else if(stored) sessionStorage.removeItem(storageKey); } catch (_) { /* tab memory still works without storage */ }
-if(sessionId) status.textContent = 'Previous tab session restored. Earlier messages remain on the server until expiration.';
+if(sessionId) {
+ status.textContent = 'Previous tab session restored. Server context remains active until expiration.';
+ const notice = document.createElement('div'); notice.className = 'welcome';
+ const noticeText = document.createElement('p'); noticeText.textContent = 'This tab restored an active server conversation. Earlier messages are not stored in the browser, but DriveWise still remembers their context until the session expires. Use New conversation to clear it.';
+ notice.append(noticeText); messages.append(notice);
+}
 function element(tag, text, className) { const node = document.createElement(tag); if(text !== undefined) node.textContent = text; if(className) node.className = className; return node; }
 function setBusy(value) { busy = value; sendButton.disabled = value; newButton.disabled = value; document.querySelectorAll('.sample').forEach(b => b.disabled = value); input.disabled = value; }
 function addMessage(role, text) { const node = element('article', undefined, 'message ' + (role === 'You' ? 'user' : 'assistant')); node.append(element('div', role, 'role'), element('div', text, 'content')); messages.append(node); messages.scrollTop = messages.scrollHeight; return node; }
@@ -90,8 +95,12 @@ function renderMarkdown(source, target) {
 function resultSummary(data) {
  if(!data || typeof data !== 'object') return 'Result available below.';
  if(data.error) return 'Could not complete: ' + data.message;
- if(data.ranked_vehicles) return data.ranked_vehicles.length + ' candidates ranked. Scores, constraints, and evidence are in the full result.';
- if(data.ambiguous && data.options) return data.option_count + ' configurations match. Select a configuration to continue.';
+ if(data.ranked_vehicles) {
+  const resolutions = data.ranked_vehicles.map(row => row.configuration_resolution).filter(Boolean);
+  const low = resolutions.filter(item => item.confidence === 'low').length;
+  return data.ranked_vehicles.length + ' candidates researched and ranked in one compound step. ' + resolutions.length + ' configurations resolved' + (low ? '; ' + low + ' low-confidence selection' + (low === 1 ? '' : 's') : '') + '.';
+ }
+ if(data.configuration_resolution) return 'EPA configuration ' + data.configuration_resolution.selected_id + ' selected with ' + data.configuration_resolution.confidence + ' confidence (' + data.configuration_resolution.mode + ').';
  if(typeof data.estimated_total_monthly === 'number') return 'Estimated total: $' + data.estimated_total_monthly.toFixed(2) + '/month before taxes and fees.';
  if(Array.isArray(data.recalls)) return data.recall_count + ' model-level recall campaigns; repair status is unknown.';
  if(Array.isArray(data.variants)) return data.variants.length + ' safety variants returned; common overall rating: ' + (data.overall_rating ?? 'unavailable or ambiguous') + '.';
@@ -100,10 +109,14 @@ function resultSummary(data) {
 function toolCard(call) {
  const card = element('details', undefined, 'tool'); card.append(element('summary', 'Research step · ' + call.name));
  let data; try { data = JSON.parse(call.result); } catch(_) { data = null; }
- card.append(element('p', resultSummary(data)), element('strong', 'Arguments'), element('pre', JSON.stringify(call.args, null, 2)));
+ card.append(element('p', resultSummary(data)));
+ const resolutions = data?.ranked_vehicles ? data.ranked_vehicles.map(row => ({candidate:[row.candidate?.year,row.candidate?.make,row.candidate?.model].filter(Boolean).join(' '), selected:row.selected_configuration, confidence:row.automatic_selection_confidence, mode:row.configuration_resolution?.mode, alternatives:row.configuration_resolution?.alternatives?.slice(0,2)})) : data?.configuration_resolution ? [{candidate:[data.year,data.make,data.model].filter(Boolean).join(' '),selected:data.configuration_resolution.selected_description,confidence:data.configuration_resolution.confidence,mode:data.configuration_resolution.mode,alternatives:data.configuration_resolution.alternatives?.slice(0,2)}] : [];
+ if(resolutions.length) { const resolution = element('details'); resolution.append(element('summary', 'Configuration resolution & confidence'), element('pre', JSON.stringify(resolutions, null, 2))); card.append(resolution); }
+ card.append(element('strong', 'Arguments'), element('pre', JSON.stringify(call.args, null, 2)));
  const full = element('details'); full.append(element('summary', 'Complete result'), element('pre', data ? JSON.stringify(data, null, 2) : call.result)); card.append(full);
  const links = element('div', undefined, 'source-links');
- for(const source of (Array.isArray(data?.sources) ? data.sources : [])) { try { const url = new URL(source); if(url.protocol !== 'https:' || !safeSourceHosts.has(url.hostname)) continue; const link = element('a', url.hostname + ' source'); link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer'; links.append(link); } catch(_) {} }
+ const sourceValues = Array.isArray(data?.sources) ? data.sources : data?.ranked_vehicles?.flatMap(row => row.government_sources_used || []) || [];
+ for(const source of [...new Set(sourceValues)]) { try { const url = new URL(source); if(url.protocol !== 'https:' || !safeSourceHosts.has(url.hostname)) continue; const link = element('a', url.hostname + ' source'); link.href = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer'; links.append(link); } catch(_) {} }
  card.append(links); return card;
 }
 async function readResponse(res) { if(!res.ok) throw new Error('http'); const data = await res.json(); if(!data || typeof data !== 'object') throw new Error('body'); return data; }

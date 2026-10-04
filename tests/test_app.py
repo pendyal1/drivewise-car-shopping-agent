@@ -16,8 +16,8 @@ class Reply:
         return result
 
 
-def call(name='calculate_ownership_cost', args=None):
-    return SimpleNamespace(id='call1', function=SimpleNamespace(name=name, arguments=args if args is not None else json.dumps({'vehicle_price':24000,'down_payment':5000,'apr_percent':0,'loan_months':60,'mpg':48})))
+def call(name='calculate_ownership_cost', args=None, call_id='call1'):
+    return SimpleNamespace(id=call_id, function=SimpleNamespace(name=name, arguments=args if args is not None else json.dumps({'vehicle_price':24000,'down_payment':5000,'apr_percent':0,'loan_months':60,'mpg':48})))
 
 
 def mock_model(monkeypatch, replies):
@@ -26,6 +26,10 @@ def mock_model(monkeypatch, replies):
     def completion(**kw):
         observed.append([dict(x) for x in kw['messages']])
         assert kw['model']=='vertex_ai/gemini-3.5-flash-lite' and kw['vertex_location']=='global'
+        if kw.get('tool_choice') == 'none':
+            assert 'tools' not in kw
+        else:
+            assert len(kw['tools']) == 5
         return SimpleNamespace(choices=[SimpleNamespace(message=next(replies))])
     monkeypatch.setattr(app.litellm,'completion',completion)
     return observed
@@ -87,12 +91,64 @@ def test_bad_model_args(monkeypatch,arguments):
     assert data['tool_calls'][0]['args']=={}
 
 
-def test_round_limit_preserves_calls(monkeypatch):
-    mock_model(monkeypatch,[Reply(calls=[call('unknown', '{}')]) for _ in range(5)])
+def test_tool_round_configuration(monkeypatch):
+    monkeypatch.delenv('MAX_TOOL_ROUNDS', raising=False)
+    assert app.max_tool_rounds() == 10
+    monkeypatch.setenv('MAX_TOOL_ROUNDS', '4')
+    assert app.max_tool_rounds() == 4
+    monkeypatch.setenv('MAX_TOOL_ROUNDS', '99')
+    assert app.max_tool_rounds() == 12
+    monkeypatch.setenv('MAX_TOOL_ROUNDS', '0')
+    assert app.max_tool_rounds() == 1
+    monkeypatch.setenv('MAX_TOOL_ROUNDS', 'invalid')
+    assert app.max_tool_rounds() == 10
+
+
+def test_multiple_calls_one_round_and_preserved(monkeypatch):
+    calls=[call(args=json.dumps({'vehicle_price':24000,'down_payment':5000,'apr_percent':0,'loan_months':60,'mpg':48}),call_id='a'),
+           call('check_vehicle_recalls',json.dumps({'year':2022,'make':'Honda','model':'Accord'}),call_id='b')]
+    mock_model(monkeypatch,[Reply(calls=calls),Reply('Combined answer.')])
     data=TestClient(app.app).post('/chat',json={'message':'research'}).json()
-    assert len(data['tool_calls'])==5 and 'limit' in data['response']
+    assert data['response']=='Combined answer.' and [item['name'] for item in data['tool_calls']]==['calculate_ownership_cost','check_vehicle_recalls']
     history=app.sessions.records[data['session_id']].messages
-    assert sum(m['role']=='tool' for m in history)==5
+    assert sum(message['role']=='tool' for message in history)==2
+
+
+def test_duplicate_tool_call_is_recorded_but_not_executed(monkeypatch):
+    model_call=call('unknown',json.dumps({'x':1}))
+    executed=[]
+    monkeypatch.setattr(app,'run_tool',lambda name,args: executed.append((name,args)) or json.dumps({'ok':True}))
+    mock_model(monkeypatch,[Reply(calls=[model_call]),Reply(calls=[model_call]),Reply('Used existing evidence.')])
+    data=TestClient(app.app).post('/chat',json={'message':'research'}).json()
+    assert len(executed)==1 and len(data['tool_calls'])==2
+    assert json.loads(data['tool_calls'][1]['result'])['error']=='duplicate_tool_call'
+
+
+def test_round_limit_forces_final_synthesis(monkeypatch):
+    monkeypatch.setenv('MAX_TOOL_ROUNDS','2')
+    observed=mock_model(monkeypatch,[Reply(calls=[call('unknown','{}',call_id='a')]),
+                                     Reply(calls=[call('unknown','{"next":1}',call_id='b')]),
+                                     Reply('Final comparison from collected evidence.')])
+    data=TestClient(app.app).post('/chat',json={'message':'research'}).json()
+    assert data['response']=='Final comparison from collected evidence.'
+    assert len(data['tool_calls'])==2 and len(observed)==3
+    assert 'Research for this user turn is complete' in observed[-1][-1]['content']
+    assert all('five-round research limit' not in (message.get('content') or '') for message in app.sessions.records[data['session_id']].messages)
+
+
+def test_no_infinite_loop_and_synthesis_fallback(monkeypatch):
+    monkeypatch.setenv('MAX_TOOL_ROUNDS','3')
+    repeated=call('unknown','{}')
+    invoked=[]
+    def completion(**kwargs):
+        invoked.append(kwargs)
+        if kwargs.get('tool_choice')=='none':
+            raise RuntimeError('synthesis failed')
+        return SimpleNamespace(choices=[SimpleNamespace(message=Reply(calls=[repeated]))])
+    monkeypatch.setattr(app.litellm,'completion',completion)
+    data=TestClient(app.app).post('/chat',json={'message':'research'}).json()
+    assert len(invoked)==4 and len(data['tool_calls'])==3
+    assert data['response'].startswith('I completed the available research')
 
 
 @pytest.mark.parametrize('body',[{'message':''},{'message':'   '},{'message':'x'*8001},{'message':'x','session_id':'SECRET'},{'message':'x','extra':'SECRET'},{}])
@@ -109,6 +165,9 @@ def test_health_root_and_headers():
     assert root.status_code==200 and 'text/html' in root.headers['content-type']
     assert 'DriveWise' in root.text and 'New conversation' in root.text
     assert 'sessionStorage' in root.text and 'renderMarkdown' in root.text
+    assert 'heavy rain and occasional snow and ice' in root.text
+    assert 'Configuration resolution &amp; confidence' in root.text or 'Configuration resolution & confidence' in root.text
+    assert 'This tab restored an active server conversation.' in root.text
     assert 'innerHTML' not in root.text
     assert "safeSourceHosts = new Set(['www.fueleconomy.gov','www.nhtsa.gov','api.nhtsa.gov'])" in root.text
     assert root.headers['x-content-type-options']=='nosniff'

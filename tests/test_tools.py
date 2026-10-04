@@ -93,16 +93,92 @@ def test_efficiency_normalization(government):
 
 
 def test_multiple_configurations(monkeypatch, government):
+    records,_=government
+    records[10]={**records[1],'id':10,'drive':'All-Wheel Drive','eng_dscr':'EX-L Hybrid','trany':'Automatic CVT','comb08':44,'fuelCost08':1250}
     original = tools.requests.get
     def get(url, **kw):
         if '/options' in url:
-            return Response({'menuItem':[{'value':'1','text':'Automatic FWD'}, {'value':'10','text':'Automatic AWD'}]})
+            return Response({'menuItem':[{'value':'1','text':'Sport Hybrid Automatic FWD'}, {'value':'10','text':'EX-L Hybrid Automatic AWD'}]})
         return original(url, **kw)
     monkeypatch.setattr(tools.requests, 'get', get)
     result = tools.get_vehicle_efficiency(**IDENTITY)
-    assert result['ambiguous'] and len(result['options']) == 2
-    assert not any('/vehicle/1' in url for url, kw in government[1])
-    assert tools.get_vehicle_efficiency(**IDENTITY, configuration='FWD')['vehicle_id'] == 1
+    assert result['vehicle_id'] in (1,10)
+    assert result['configuration_resolution']['mode']=='representative'
+    assert result['configuration_resolution']['confidence']=='low'
+    assert result['configuration_resolution']['alternatives']
+    assert tools.get_vehicle_efficiency(**IDENTITY, trim='EX-L')['vehicle_id'] == 10
+    assert tools.get_vehicle_efficiency(**IDENTITY, trim='ex-l')['vehicle_id'] == 10
+    assert tools.get_vehicle_efficiency(**IDENTITY, drivetrain='awd')['vehicle_id'] == 10
+    assert tools.get_vehicle_efficiency(**IDENTITY, drivetrain='all-wheel-drive')['vehicle_id'] == 10
+
+
+def test_exact_configuration_id(government):
+    result=tools.get_vehicle_efficiency(**IDENTITY,configuration_id=1)
+    assert result['vehicle_id']==1
+    assert result['configuration_resolution']['mode']=='exact'
+    assert result['configuration_resolution']['confidence']=='high'
+
+
+def test_powertrain_and_transmission_matching(monkeypatch,government):
+    records,_=government
+    records[10]={**records[1],'id':10,'atvType':'','fuelType1':'Regular Gasoline','eng_dscr':'LX gasoline','trany':'Manual 6-spd','comb08':30,'fuelCost08':1800}
+    original=tools.requests.get
+    def get(url,**kw):
+        if '/options' in url:
+            return Response({'menuItem':[{'value':'1','text':'Hybrid eCVT'}, {'value':'10','text':'LX Manual 6-spd'}]})
+        return original(url,**kw)
+    monkeypatch.setattr(tools.requests,'get',get)
+    hybrid=tools.get_vehicle_efficiency(**IDENTITY,fuel_type='hybrid')
+    automatic=tools.get_vehicle_efficiency(**IDENTITY,transmission='automatic')
+    assert hybrid['vehicle_id']==1 and automatic['vehicle_id']==1
+    unresolved=tools.get_vehicle_efficiency(**IDENTITY)
+    assert unresolved['configuration_resolution']['mode']=='ambiguous'
+    assert unresolved['configuration_resolution']['requires_clarification'] is True
+    assert unresolved['configuration_resolution']['possible_result_range']['combined_mpg']=={'minimum':30.0,'maximum':48.0}
+
+
+def test_representative_selection_is_stable(monkeypatch,government):
+    records,_=government
+    records[10]={**records[1],'id':10,'comb08':40,'fuelCost08':1400,'eng_dscr':'Touring'}
+    records[11]={**records[1],'id':11,'comb08':44,'fuelCost08':1300,'eng_dscr':'Limited Edition'}
+    original=tools.requests.get
+    def get(url,**kw):
+        if '/options' in url:
+            return Response({'menuItem':[{'value':'11','text':'Limited Edition'}, {'value':'10','text':'Touring'}, {'value':'1','text':'Sport'}]})
+        return original(url,**kw)
+    monkeypatch.setattr(tools.requests,'get',get)
+    first=tools.get_vehicle_efficiency(**IDENTITY)
+    second=tools.get_vehicle_efficiency(**IDENTITY)
+    assert first['vehicle_id']==second['vehicle_id']
+    assert first['configuration_resolution']['mode']=='representative'
+
+
+def test_malformed_configuration_data(monkeypatch,government):
+    original=tools.requests.get
+    monkeypatch.setattr(tools.requests,'get',lambda url,**kw: Response({'menuItem':[{'value':'bad','text':'Broken'}]}) if '/options' in url else original(url,**kw))
+    result=tools.get_vehicle_efficiency(**IDENTITY)
+    assert result['error']=='malformed_response'
+
+
+def test_epa_trim_suffixed_model_family_resolution(monkeypatch):
+    records={21:{'id':21,'year':2022,'make':'Toyota','model':'Camry Hybrid LE','atvType':'Hybrid',
+                 'fuelType1':'Regular Gasoline','comb08':52,'fuelCost08':1000,'trany':'Automatic CVT','drive':'Front-Wheel Drive'},
+             22:{'id':22,'year':2022,'make':'Toyota','model':'Camry Hybrid SE/XLE/XSE','atvType':'Hybrid',
+                 'fuelType1':'Regular Gasoline','comb08':46,'fuelCost08':1150,'trany':'Automatic CVT','drive':'Front-Wheel Drive'}}
+    def menu(path,params=None):
+        if path=='year': return [{'text':'2022','value':'2022'}]
+        if path=='make': return [{'text':'Toyota','value':'Toyota'}]
+        if path=='model': return [{'text':'Camry','value':'Camry'},{'text':'Camry Hybrid LE','value':'Camry Hybrid LE'},
+                                  {'text':'Camry Hybrid SE/XLE/XSE','value':'Camry Hybrid SE/XLE/XSE'}]
+        if path=='options':
+            vehicle_id=21 if params['model'].endswith(' LE') else 22
+            return [{'text':'2.5L Automatic CVT FWD','value':str(vehicle_id)}]
+        raise AssertionError(path)
+    monkeypatch.setattr(tools,'_menu',menu)
+    monkeypatch.setattr(tools,'safe_get',lambda url,params=None: records[int(url.rsplit('/',1)[1])])
+    result=tools.get_vehicle_efficiency(year=2022,make='Toyota',model='Camry Hybrid',trim='LE')
+    assert result['vehicle_id']==21
+    assert result['configuration_resolution']['mode']=='matched'
 
 
 def test_xml_fallback(monkeypatch):
@@ -148,9 +224,11 @@ def test_vehicle_id_identity_mismatch(government):
     assert tools.get_vehicle_efficiency(**IDENTITY, vehicle_id=2)['error'] == 'no_matching_data'
 
 
-def test_missing_model_options(government):
+def test_base_model_expands_to_epa_model_family(government):
     result = tools.get_vehicle_efficiency(**{**IDENTITY, 'model':'Accord'})
-    assert result['error'] == 'no_matching_data' and result['model_options']
+    assert result['vehicle_id']==1
+    assert result['model']=='Accord Hybrid'
+    assert result['configuration_resolution']['confidence']=='low'
 
 
 def test_recall_parsing(government):
