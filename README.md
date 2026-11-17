@@ -76,10 +76,8 @@ DriveWise requires Python 3.10 or newer and [uv](https://docs.astral.sh/uv/). Fr
 
 ```bash
 uv sync --locked
-gcloud auth login ap4839@columbia.edu
-gcloud config set account ap4839@columbia.edu
-gcloud auth application-default login --account=ap4839@columbia.edu
-gcloud config set project ieor-4570-f26-ap4839
+gcloud auth application-default login
+export GOOGLE_CLOUD_PROJECT=your-google-cloud-project-id
 uv run uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
@@ -98,7 +96,7 @@ The tests mock Gemini and external HTTP requests. They cover cost calculations, 
 
 ## Deployment
 
-DriveWise is intended to run on Google Cloud Run with Vertex AI. The target project is `ieor-4570-f26-ap4839`, and the intended Cloud Run region is `us-central1`. Deployment uses continuous delivery from the GitHub repository through Google Cloud Build.
+DriveWise is intended to run on Google Cloud Run with Vertex AI. Set `GOOGLE_CLOUD_PROJECT` to your Vertex AI-enabled project. Deployment uses continuous delivery from the GitHub repository through Google Cloud Build.
 
 Enable the Vertex AI, Cloud Run, Cloud Build, Artifact Registry, Developer Connect, Secret Manager, and Identity-Aware Proxy APIs. The runtime service account normally needs `roles/aiplatform.user`. Configure the service to run:
 
@@ -107,8 +105,6 @@ uvicorn app:app --host 0.0.0.0 --port $PORT
 ```
 
 Sessions are currently stored in process memory, so this version should use a maximum of one Cloud Run instance. A restart or new revision can still clear active conversations.
-
-The public Cloud Run URL will be added after the first deployment.
 
 ## Honest limitations
 

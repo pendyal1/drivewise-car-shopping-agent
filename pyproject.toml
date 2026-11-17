@@ -1,7 +1,7 @@
 [project]
 name = "drivewise-car-shopping-agent"
 version = "0.1.0"
-description = "IEOR 4570 Project 1: a Gemini tool-calling car-shopping advisor"
+description = "A Gemini tool-calling agent for comparing cars"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.109.0",

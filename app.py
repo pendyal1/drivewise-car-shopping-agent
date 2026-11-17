@@ -1,4 +1,4 @@
-"""DriveWise's class-starter Gemini harness and bounded in-memory sessions."""
+"""DriveWise's Gemini tool-calling adapter and bounded in-memory sessions."""
 import json
 import os
 import threading

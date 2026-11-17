@@ -66,7 +66,7 @@ def safe_get(url, params=None):
     if context and time.monotonic() >= context['deadline']:
         return error('timeout', 'The government-data request budget was reached.', 'Retry one candidate at a time.')
     try:
-        with requests.get(url, params=params, headers={'Accept': 'application/json', 'User-Agent': 'DriveWise/1.0 (IEOR4570 educational comparison)'},
+        with requests.get(url, params=params, headers={'Accept': 'application/json', 'User-Agent': 'DriveWise/1.0'},
                           timeout=(3, 6), stream=True, allow_redirects=False) as response:
             status = response.status_code
             if status == 429:
